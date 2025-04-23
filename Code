@@ -1,0 +1,159 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+st.set_page_config(layout="wide")
+st.title("Procesamiento e Interpolación de Curvas - Bloomberg")
+
+# ----------- Funciones utilitarias ----------- #
+@st.cache_data
+def load_excel(file):
+    xls = pd.ExcelFile(file)
+    return xls
+
+def clean_sheet_name(sheet_name):
+    return sheet_name.replace(" ", "_").replace("-", "_")
+
+def process_specific_tables(df):
+    specific_headers = ["MONEDA", "COMPRA", "VENTA"]
+    if all(header in df.iloc[0].values for header in specific_headers):
+        df.columns = df.iloc[0]
+        df = df[1:].reset_index(drop=True)
+        return df
+    return None
+
+def extract_tables_from_excel(xls):
+    dataframes = {}
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+        blank_columns = [i for i, col in enumerate(df.columns) if df[col].isna().all()]
+        start_col = 0
+        table_count = 1
+        for col in blank_columns + [df.shape[1]]:
+            if start_col < col:
+                sub_df = df.iloc[:, start_col:col].dropna(how='all')
+                if not sub_df.empty:
+                    processed_df = process_specific_tables(sub_df)
+                    if processed_df is not None:
+                        sub_df = processed_df
+                    else:
+                        sub_df.columns = sub_df.iloc[0]
+                        sub_df = sub_df[1:].reset_index(drop=True)
+                    cleaned_name = clean_sheet_name(sheet_name)
+                    df_name = f"{cleaned_name}_{table_count}"
+                    dataframes[df_name] = sub_df
+                    table_count += 1
+            start_col = col + 1
+    return dataframes
+
+def cubic_spline(df, input_column_name, output_column_names, points):
+    if input_column_name not in df.columns:
+        return None
+    input_column = df[input_column_name].dropna().values
+    n = len(input_column)
+    if n <= 1:
+        return None
+    sorted_indices = np.argsort(input_column)
+    xin = input_column[sorted_indices]
+    results_dict = {'Plazo (días)': points}
+    for output_column_name in output_column_names:
+        if output_column_name not in df.columns:
+            return None
+        yin = df[output_column_name].dropna().values
+        if len(yin) != n:
+            return None
+        yin = yin[sorted_indices]
+        yt = np.zeros(n)
+        u = np.zeros(n - 1)
+        yt[0] = 0
+        u[0] = 0
+        for i in range(1, n - 1):
+            sig = (xin[i] - xin[i - 1]) / (xin[i + 1] - xin[i - 1])
+            p = sig * yt[i - 1] + 2
+            yt[i] = (sig - 1) / p
+            u[i] = (yin[i + 1] - yin[i]) / (xin[i + 1] - xin[i]) - (yin[i] - yin[i - 1]) / (xin[i] - xin[i - 1])
+            u[i] = (6 * u[i] / (xin[i + 1] - xin[i - 1]) - sig * u[i - 1]) / p
+        yt[n - 1] = (0 - 0 * u[n - 2]) / (0 * yt[n - 2] + 1)
+        for k in range(n - 2, 0, -1):
+            yt[k] = yt[k] * yt[k + 1] + u[k]
+
+        def evaluate_point(x):
+            klo = 0
+            khi = n - 1
+            while khi - klo > 1:
+                k = (khi + klo) // 2
+                if xin[k] > x:
+                    khi = k
+                else:
+                    klo = k
+            h = xin[khi] - xin[klo]
+            a = (xin[khi] - x) / h
+            b = (x - xin[klo]) / h
+            y = a * yin[klo] + b * yin[khi] + ((a ** 3 - a) * yt[klo] + (b ** 3 - b) * yt[khi]) * (h ** 2) / 6
+            return y
+
+        results = [evaluate_point(x) for x in points]
+        results_dict[output_column_name] = results
+
+    return pd.DataFrame(results_dict)
+
+def apply_cubic_spline_to_dict(dataframes, points):
+    results = {}
+    for name, df in list(dataframes.items()):
+        try:
+            if 'ION' in name or 'TC' in name or 'BBG' in name or 'Contrato' in name or 'Parámetro' in name:
+                results[name] = df
+            else:
+                if 'Plazo en días' in df.columns:
+                    for cols in [['Bid', 'Mid', 'Ask'], ['Tasa Cero'], ['Mid']]:
+                        result = cubic_spline(df, 'Plazo en días', cols, points)
+                        if result is not None:
+                            results[name] = result
+                            break
+                elif 'Plazo (DIAS)' in df.columns:
+                    result = cubic_spline(df, 'Plazo (DIAS)', ['Tasas(%)'], points)
+                    if result is not None:
+                        results[name] = result
+        except Exception as e:
+            st.warning(f"Error procesando {name}: {e}")
+    return results
+import io
+
+def export_results_to_excel(results_dict):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for sheet_name, df in results_dict.items():
+            df.to_excel(writer, sheet_name=sheet_name[:31], startrow=8, index=False)
+        writer.close()
+    output.seek(0)
+    return output
+
+# ----------- Interfaz Streamlit ----------- #
+uploaded_file = st.file_uploader("Carga tu archivo Excel de Bloomberg", type=["xlsx"])
+
+if uploaded_file:
+    xls = load_excel(uploaded_file)
+    dataframes = extract_tables_from_excel(xls)
+    
+    st.subheader("Tablas extraídas")
+    selected_table = st.selectbox("Selecciona una tabla para visualizar", list(dataframes.keys()))
+    st.dataframe(dataframes[selected_table], use_container_width=True)
+
+    if st.button("Aplicar interpolación cúbica"):
+        points = list(range(1, 12001))
+        interpolated_results = apply_cubic_spline_to_dict(dataframes, points)
+
+        st.subheader("Resultados Interpolados")
+        for name, df in interpolated_results.items():
+            st.write(f"📊 {name}")
+            st.dataframe(df.head(10), use_container_width=True)
+else:
+    st.info("Por favor, sube un archivo Excel para comenzar.")
+
+# Exportar archivo Excel
+excel_data = export_results_to_excel(interpolated_results)
+st.download_button(
+    label="📥 Descargar resultados interpolados (Excel)",
+    data=excel_data,
+    file_name="resultados_interpolados.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
